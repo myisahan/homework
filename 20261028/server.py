@@ -1,50 +1,106 @@
-import json
+import asyncio
+import logging
+import os
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from langchain.chat_models import init_chat_model
+from openai import APIConnectionError, APIStatusError
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("homework.log", encoding="utf-8")],
+)
+logger = logging.getLogger(__name__)
+
+# 密钥从环境变量读取，不写进代码。
+model = init_chat_model(
+    model=os.environ["MAIN_MODEL_NAME"],
+    base_url=os.environ["MAIN_BASE_URL"],
+    api_key=os.environ["MAIN_API_KEY"],
+    model_provider="openai",
+    max_retries=0,  # 由下面的循环控制重试次数
+    timeout=30,
+)
+
+model2 = None
+if os.getenv("BACKUP_BASE_URL"):
+    model2 = init_chat_model(
+        model=os.environ["BACKUP_MODEL_NAME"],
+        base_url=os.environ["BACKUP_BASE_URL"],
+        api_key=os.environ["BACKUP_API_KEY"],
+        model_provider="openai",
+        max_retries=0,
+        timeout=30,
+    )
 
 app = FastAPI()
-DEMO_TOKEN = "demo-token"
 
 
-@app.post("/add_one")
-async def add_one(request: Request):
-    # 第一步：读取客户端通过 json=... 发送的请求体。
-    # 如果发来的内容不是合法JSON，返回400，请客户端修正后再发。
+@app.post("/users")
+async def user_chat(request: Request):
+    logger.info("收到请求")
     try:
         data = await request.json()
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise HTTPException(status_code=400, detail="请求体必须是合法JSON")
+    except ValueError:
+        logger.warning("400：请求体不是有效的 JSON")
+        raise HTTPException(400, "请求体必须是有效的 JSON")
 
-    # 本接口约定请求体是字典，例如 {"number": 50}。
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="请求体必须是JSON对象")
+    messages = data.get("messages") if isinstance(data, dict) else None
+    if not isinstance(messages, list) or not messages:
+        logger.warning("400：messages 缺失或格式错误")
+        raise HTTPException(400, "messages 必须是非空列表")
 
-    # 第二步：检查参数，对应400。
-    # 不能写 if not number，因为合法数字0也会被误判为缺少参数。
-    if "number" not in data:
-        raise HTTPException(status_code=400, detail="缺少number参数")
+    # 最多尝试3次：第一次调用 + 两次重试。
+    for i in range(3):
+        try:
+            response = await model.ainvoke(messages)
+            if not response.content:
+                logger.warning("主模型返回空内容")
+                raise HTTPException(502, "模型返回空内容")
+            logger.info("主模型调用成功，第 %d 次", i + 1)
+            return {"ai_content": response.content}
 
-    number = data["number"]
-    # number必须是数字；Python把bool也视为int的一种，所以单独排除。
-    if isinstance(number, bool) or not isinstance(number, (int, float)):
-        raise HTTPException(status_code=400, detail="number必须是整数或小数")
+        except APIStatusError as e:
+            # 模型服务报错时，从异常中读取状态码。
+            if e.status_code == 400:
+                logger.warning("400：模型请求参数错误，不重试")
+                raise HTTPException(400, "请检查模型请求参数")
+            elif e.status_code == 401:
+                logger.error("401：模型密钥无效，不重试")
+                raise HTTPException(401, "请检查服务端模型密钥")
+            elif e.status_code == 500:
+                logger.warning("500：主模型调用失败，第 %d 次", i + 1)
+                if i < 2:
+                    await asyncio.sleep(1)
+            else:
+                logger.error("模型服务返回状态码：%d", e.status_code)
+                raise HTTPException(502, "模型服务调用失败")
+        except APIConnectionError:
+            logger.error("模型连接失败或超时")
+            raise HTTPException(503, "无法连接模型服务")
 
-    # 第三步：检查请求头里的身份凭证，对应401。
-    # 请求头的名称沿用老师的例子；这里只验证课堂演示凭证。
-    token = request.headers.get("x-acs-dingtalk-access-token")
-    if token != DEMO_TOKEN:
-        raise HTTPException(status_code=401, detail="身份凭证缺失或不正确")
+    # 连续3次500后，调用一次备用模型。
+    if model2 is None:
+        logger.error("主模型重试失败，未配置备用模型")
+        raise HTTPException(500, "重试失败，未配置备用模型")
 
-    # 第四步：模拟服务端内部错误，对应500。
-    # 客户端传 {"number": 50, "simulate_500": True} 就会走这里。
-    # 这个开关属于补充教学内容，目的是稳定复现错误。
-    if data.get("simulate_500") is True:
-        raise HTTPException(status_code=500, detail="课堂模拟：服务端暂时出错")
-
-    # 第五步：所有检查通过，正常计算并返回，HTTP状态码默认是200。
-    return {"result": number + 1}
+    logger.warning("切换备用模型")
+    try:
+        response = await model2.ainvoke(messages)
+        if not response.content:
+            logger.error("备用模型返回空内容")
+            raise HTTPException(500, "备用模型返回空内容")
+        logger.info("备用模型调用成功")
+        return {"ai_content": response.content}
+    except APIStatusError as e:
+        logger.error("备用模型失败，状态码：%d", e.status_code)
+        raise HTTPException(500, "主模型和备用模型均调用失败")
+    except APIConnectionError:
+        logger.error("备用模型连接失败或超时")
+        raise HTTPException(500, "备用模型连接失败")
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8002)
